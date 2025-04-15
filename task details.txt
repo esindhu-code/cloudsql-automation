@@ -1,0 +1,128 @@
+Prerequisites
+================
+Ensure the Cloud Function has the necessary IAM permissions:
+roles/cloudsql.admin for accessing the Cloud SQL Admin API.
+roles/pubsub.subscriber for receiving Pub/Sub messages.
+roles/logging.logWriter for writing logs.
+======================================
+Install the required Python dependencies in your requirements.txt file:
+google-cloud-pubsub
+google-cloud-sqladmin
+google-cloud-logging
+======================================
+
+import json
+import logging
+import time
+from google.cloud import sqladmin_v1beta4, pubsub_v1, logging as cloud_logging
+ 
+# Initialize Cloud Logging for structured logs
+cloud_logging.Client().setup_logging()
+ 
+# Constants
+PROJECT_ID = "your-project-id"
+RETRY_LIMIT = 3  # Maximum number of retries for failed backups
+ALERT_TOPIC = "projects/your-project-id/topics/backup-alerts"  # Optional Pub/Sub topic for alerts
+ 
+ 
+def initiate_backup(instance_id):
+    """Initiate a backup for the given Cloud SQL instance."""
+    try:
+        # Initialize Cloud SQL Admin API client
+        client = sqladmin_v1beta4.SqlAdminServiceClient()
+ 
+        # Prepare the backup request
+        request = {
+            "project": PROJECT_ID,
+            "instance": instance_id,
+            "body": {"kind": "sql#backupRun"}
+        }
+ 
+        # Trigger the backup using the API
+        operation = client.insert_backup_run(request=request)
+        logging.info(f"Backup initiated for instance: {instance_id}. Operation: {operation.name}")
+        return operation.name
+ 
+    except Exception as e:
+        logging.error(f"Failed to initiate backup for instance {instance_id}: {e}")
+        raise
+ 
+ 
+def check_backup_status(operation_name, instance_id):
+    """Check the status of a backup operation."""
+    try:
+        client = sqladmin_v1beta4.SqlAdminServiceClient()
+        operation = client.get_operation(
+            project=PROJECT_ID,
+            operation=operation_name,
+            instance=instance_id,
+        )
+        return operation.status == "DONE", operation.error if operation.error else None
+ 
+    except Exception as e:
+        logging.error(f"Failed to check backup status: {e}")
+        raise
+ 
+ 
+def publish_alert(message):
+    """Publish an alert message to a Pub/Sub topic."""
+    try:
+        publisher = pubsub_v1.PublisherClient()
+        publisher.publish(ALERT_TOPIC, json.dumps(message).encode("utf-8"))
+        logging.info(f"Published alert message: {message}")
+    except Exception as e:
+        logging.error(f"Failed to publish alert: {e}")
+ 
+ 
+def retry_backup(instance_id):
+    """Retry the backup process with exponential backoff."""
+    attempt = 0
+    while attempt < RETRY_LIMIT:
+        try:
+            operation_name = initiate_backup(instance_id)
+            time.sleep(2 ** attempt)  # Exponential backoff
+            success, error = check_backup_status(operation_name, instance_id)
+            if success:
+                logging.info(f"Backup succeeded on retry attempt {attempt + 1} for instance {instance_id}")
+                return True
+            else:
+                logging.warning(f"Retry attempt {attempt + 1} failed: {error}")
+                attempt += 1
+ 
+        except Exception as e:
+            logging.error(f"Retry attempt {attempt + 1} failed due to error: {e}")
+            attempt += 1
+ 
+    logging.error(f"Backup failed after {RETRY_LIMIT} retries for instance {instance_id}")
+    return False
+ 
+ 
+def process_pubsub_message(event, context):
+    """Cloud Function entry point triggered by Pub/Sub."""
+    try:
+        # Parse Pub/Sub message
+        pubsub_message = json.loads(event["data"].decode("utf-8"))
+        instance_id = pubsub_message.get("instance_id")
+        if not instance_id:
+            raise ValueError("Missing 'instance_id' in Pub/Sub message.")
+ 
+        # Initiate backup
+        operation_name = initiate_backup(instance_id)
+        # Check backup status
+        success, error = check_backup_status(operation_name, instance_id)
+        if success:
+            logging.info(f"Backup succeeded for instance: {instance_id}")
+        else:
+            logging.warning(f"Backup failed for instance: {instance_id}. Error: {error}")
+            # Retry logic
+            if not retry_backup(instance_id):
+                # Publish alert if all retries fail (optional)
+                alert_message = {
+                    "instance_id": instance_id,
+                    "error": str(error),
+                    "timestamp": time.time(),
+                }
+                publish_alert(alert_message)
+ 
+    except Exception as e:
+        logging.error(f"Error processing Pub/Sub message: {e}")
